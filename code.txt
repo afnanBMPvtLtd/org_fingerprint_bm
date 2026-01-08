@@ -1,0 +1,245 @@
+#include <ESP8266WiFi.h>
+#include <WiFiManager.h>
+#include <Adafruit_Fingerprint.h>
+#include <PubSubClient.h>
+#include <SoftwareSerial.h>
+#include <time.h>
+#include <DoubleResetDetector.h>
+
+/* ================= DEVICE SECURITY ================= */
+#define DEVICE_ID "251221000001"
+#define DEVICE_SECRET_KEY "SECURE_KEY_251221000001"
+
+/* ================= PINS ================= */
+#define LED 2
+#define RX_PIN 4
+#define TX_PIN 5
+
+/* ================= RESET ================= */
+#define DRD_TIMEOUT 2
+#define DRD_ADDRESS 0
+DoubleResetDetector drd(DRD_TIMEOUT, DRD_ADDRESS);
+
+/* ================= FINGERPRINT ================= */
+SoftwareSerial fingerSerial(RX_PIN, TX_PIN);
+Adafruit_Fingerprint finger(&fingerSerial);
+
+/* ================= MQTT ================= */
+const char* mqtt_server = "137.97.126.110";
+const int mqtt_port = 1883;
+
+/* ================= DEVICE SCOPED TOPICS ================= */
+char TOPIC_SCAN[64];
+char TOPIC_ENROLL[64];
+char TOPIC_DELETE[64];
+char TOPIC_DELALL[64];
+char TOPIC_RESET[64];
+char TOPIC_STATUS[64];
+
+/* ================= GLOBALS ================= */
+WiFiManager wm;
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+unsigned long lastScanTime[128];
+const unsigned long COOLDOWN_MS = 10000;
+const unsigned long SCAN_GAP_MS = 300;
+
+unsigned long lastPoll = 0;
+unsigned long lastStatusSent = 0;
+const unsigned long STATUS_INTERVAL_MS = 10000;
+
+/* ================= WEAK FINGER TUNING ================= */
+#define IMAGE_RETRIES 3
+#define ENROLL_WAIT_MS 5000
+#define ENROLL_LIFT_DELAY 700
+#define MIN_CONFIDENCE 45
+
+/* ================= FUNCTION PROTOTYPES ================= */
+void enrollFingerprint(uint8_t id);
+void scanFingerprint();
+
+/* ================= BUILD TOPICS ================= */
+void buildTopics() {
+  snprintf(TOPIC_SCAN,   sizeof(TOPIC_SCAN),   "device/%s/scan",      DEVICE_ID);
+  snprintf(TOPIC_ENROLL, sizeof(TOPIC_ENROLL), "device/%s/enroll",    DEVICE_ID);
+  snprintf(TOPIC_DELETE, sizeof(TOPIC_DELETE), "device/%s/delete",    DEVICE_ID);
+  snprintf(TOPIC_DELALL, sizeof(TOPIC_DELALL), "device/%s/deleteAll", DEVICE_ID);
+  snprintf(TOPIC_RESET,  sizeof(TOPIC_RESET),  "device/%s/reset",     DEVICE_ID);
+  snprintf(TOPIC_STATUS, sizeof(TOPIC_STATUS), "device/%s/status",    DEVICE_ID);
+}
+
+/* ================= TIME (UTC) ================= */
+String getUTCTime() {
+  time_t now = time(nullptr);
+  if (now < 100000) return "1970-01-01 00:00:00";
+
+  struct tm *t = gmtime(&now);
+  char buf[25];
+  sprintf(buf, "%04d-%02d-%02d %02d:%02d:%02d",
+          t->tm_year + 1900,
+          t->tm_mon + 1,
+          t->tm_mday,
+          t->tm_hour,
+          t->tm_min,
+          t->tm_sec);
+  return String(buf);
+}
+
+/* ================= MQTT CALLBACK ================= */
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+
+  String msg;
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+  msg.trim();
+
+  int sep = msg.indexOf('|');
+  if (sep == -1) return;
+
+  String secret = msg.substring(0, sep);
+  String data   = msg.substring(sep + 1);
+
+  if (secret != DEVICE_SECRET_KEY) return;
+
+  if (strcmp(topic, TOPIC_ENROLL) == 0) {
+    int id = data.toInt();
+    if (id >= 1 && id <= 127) enrollFingerprint(id);
+  }
+  else if (strcmp(topic, TOPIC_DELETE) == 0) {
+    int id = data.toInt();
+    if (id >= 1 && id <= 127) finger.deleteModel(id);
+  }
+  else if (strcmp(topic, TOPIC_DELALL) == 0 && data == "CONFIRM") {
+    finger.emptyDatabase();
+  }
+  else if (strcmp(topic, TOPIC_RESET) == 0 && data == "REBOOT") {
+    ESP.restart();
+  }
+}
+
+/* ================= MQTT CONNECT ================= */
+void reconnectMQTT() {
+  static unsigned long lastAttempt = 0;
+  if (millis() - lastAttempt < 5000) return;
+  lastAttempt = millis();
+
+  Serial.println("[MQTT] Attempting connection...");
+
+  if (client.connect(DEVICE_ID)) {
+    Serial.println("[MQTT] Connected");
+    client.subscribe(TOPIC_ENROLL);
+    client.subscribe(TOPIC_DELETE);
+    client.subscribe(TOPIC_DELALL);
+    client.subscribe(TOPIC_RESET);
+    publishOnlineStatus();
+  } else {
+    Serial.print("[MQTT] Failed, rc=");
+    Serial.println(client.state());
+  }
+}
+
+
+/* ================= SAFE WAIT ================= */
+bool waitForFinger(uint16_t timeoutMs) {
+  unsigned long start = millis();
+  while (millis() - start < timeoutMs) {
+    client.loop();
+    if (finger.getImage() == FINGERPRINT_OK) return true;
+    delay(20);
+  }
+  return false;
+}
+
+/* ================= IMAGE CONVERT ================= */
+bool convertImage(uint8_t slot = 1) {
+  for (int i = 0; i < IMAGE_RETRIES; i++) {
+    if (finger.image2Tz(slot) == FINGERPRINT_OK) return true;
+    delay(60);
+  }
+  return false;
+}
+
+/* ================= ENROLL ================= */
+void enrollFingerprint(uint8_t id) {
+
+  if (!waitForFinger(ENROLL_WAIT_MS)) return;
+  if (!convertImage(1)) return;
+
+  delay(ENROLL_LIFT_DELAY);
+
+  if (!waitForFinger(ENROLL_WAIT_MS)) return;
+  if (!convertImage(2)) return;
+
+  if (finger.createModel() != FINGERPRINT_OK) return;
+  finger.storeModel(id);
+}
+
+/* ================= SCAN ================= */
+void scanFingerprint() {
+
+  if (finger.getImage() != FINGERPRINT_OK) return;
+  if (!convertImage()) return;
+  if (finger.fingerSearch() != FINGERPRINT_OK) return;
+  if (finger.confidence < MIN_CONFIDENCE) return;
+
+  uint8_t id = finger.fingerID;
+  if (millis() - lastScanTime[id] < COOLDOWN_MS) return;
+  lastScanTime[id] = millis();
+
+  String payload = String(DEVICE_SECRET_KEY) + "|" +
+                   "{\"id\":" + String(id) +
+                   ",\"deviceId\":\"" + DEVICE_ID +
+                   "\",\"time\":\"" + getUTCTime() + "\"}";
+
+  client.publish(TOPIC_SCAN, payload.c_str());
+
+  digitalWrite(LED, HIGH);
+  delay(100);
+  digitalWrite(LED, LOW);
+}
+
+/* ================= STATUS ================= */
+void publishOnlineStatus() {
+  String payload = String(DEVICE_SECRET_KEY) + "|" +
+                   "{\"deviceId\":\"" + DEVICE_ID +
+                   "\",\"status\":\"ONLINE\"}";
+  client.publish(TOPIC_STATUS, payload.c_str(), true);
+}
+
+/* ================= SETUP ================= */
+void setup() {
+  Serial.begin(115200);
+  pinMode(LED, OUTPUT);
+
+  if (drd.detectDoubleReset()) wm.resetSettings();
+  wm.autoConnect("ESP8266_Attendance");
+
+  buildTopics();
+  configTime(0, 0, "pool.ntp.org");
+  Serial.println("[SETUP] MQTT & Fingerprint init complete");
+  fingerSerial.begin(57600);
+  finger.begin(57600);
+  finger.verifyPassword();
+
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(mqttCallback);
+
+  for (int i = 0; i < 128; i++) lastScanTime[i] = 0;
+}
+
+/* ================= LOOP ================= */
+void loop() {
+
+  if (!client.connected()) reconnectMQTT();
+  client.loop();
+
+  if (millis() - lastStatusSent >= STATUS_INTERVAL_MS) {
+    lastStatusSent = millis();
+    publishOnlineStatus();
+  }
+
+  if (millis() - lastPoll < SCAN_GAP_MS) return;
+  lastPoll = millis();
+
+  scanFingerprint();
+}
