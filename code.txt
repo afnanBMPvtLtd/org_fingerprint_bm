@@ -1,0 +1,240 @@
+#include <ESP8266WiFi.h>
+#include <WiFiManager.h>
+#include <Adafruit_Fingerprint.h>
+#include <PubSubClient.h>
+#include <SoftwareSerial.h>
+#include <time.h>
+#include <DoubleResetDetector.h>
+
+/* ================= DEVICE SECURITY ================= */
+#define DEVICE_ID "251221000001"
+#define DEVICE_SECRET_KEY "SECURE_KEY_251221000001"
+
+/* ================= PINS ================= */
+#define LED 2          // D4 (Active LOW)
+#define RX_PIN 4       // D2
+#define TX_PIN 5       // D1
+
+/* ================= RESET ================= */
+#define DRD_TIMEOUT 2
+#define DRD_ADDRESS 0
+DoubleResetDetector drd(DRD_TIMEOUT, DRD_ADDRESS);
+
+/* ================= FINGERPRINT ================= */
+SoftwareSerial fingerSerial(RX_PIN, TX_PIN);
+Adafruit_Fingerprint finger(&fingerSerial);
+
+/* ================= MQTT ================= */
+const char* mqtt_server = "137.97.126.110";
+const int mqtt_port = 1883;
+
+/* ================= DEVICE TOPICS ================= */
+char TOPIC_SCAN[64];
+char TOPIC_ENROLL[64];
+char TOPIC_ENROLL_RESULT[64];
+char TOPIC_DELETE[64];
+char TOPIC_DELALL[64];
+char TOPIC_RESET[64];
+char TOPIC_STATUS[64];
+
+/* ================= GLOBALS ================= */
+WiFiManager wm;
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+bool enrolling = false;
+
+/* ================= TIMERS ================= */
+unsigned long lastHeartbeat = 0;
+const unsigned long HEARTBEAT_INTERVAL = 60000;
+
+unsigned long lastNotGrantedTime = 0;
+const unsigned long NOT_GRANTED_COOLDOWN = 3000;
+
+/* ================= LED LOW POWER ================= */
+inline void ledOn()  { digitalWrite(LED, LOW); }
+inline void ledOff() { digitalWrite(LED, HIGH); }
+
+void blink(int times, int onMs, int offMs) {
+  for (int i = 0; i < times; i++) {
+    ledOn(); delay(onMs);
+    ledOff(); delay(offMs);
+  }
+  ledOff();
+}
+
+/* ================= LED STATES ================= */
+void ledBoot()          { blink(2, 400, 400); }
+void ledEnrollWait()    { blink(1, 120, 180); }
+void ledEnrollSuccess() { blink(3, 150, 150); }
+void ledEnrollFail()    { ledOn(); delay(2000); ledOff(); }
+void ledGranted()       { ledOn(); delay(120); ledOff(); }
+void ledDenied()        { blink(2, 100, 100); }
+void ledHeartbeat()     { ledOn(); delay(30); ledOff(); }
+
+/* ================= BUILD AP NAME ================= */
+void buildApName(char* ap, size_t len) {
+  snprintf(ap, len, "BandyMoot-%s", DEVICE_ID + strlen(DEVICE_ID) - 4);
+}
+
+/* ================= BUILD TOPICS ================= */
+void buildTopics() {
+  snprintf(TOPIC_SCAN, sizeof(TOPIC_SCAN), "device/%s/scan", DEVICE_ID);
+  snprintf(TOPIC_ENROLL, sizeof(TOPIC_ENROLL), "device/%s/enroll", DEVICE_ID);
+  snprintf(TOPIC_ENROLL_RESULT, sizeof(TOPIC_ENROLL_RESULT), "device/%s/enroll/result", DEVICE_ID);
+  snprintf(TOPIC_DELETE, sizeof(TOPIC_DELETE), "device/%s/delete", DEVICE_ID);
+  snprintf(TOPIC_DELALL, sizeof(TOPIC_DELALL), "device/%s/deleteAll", DEVICE_ID);
+  snprintf(TOPIC_RESET, sizeof(TOPIC_RESET), "device/%s/reset", DEVICE_ID);
+  snprintf(TOPIC_STATUS, sizeof(TOPIC_STATUS), "device/%s/status", DEVICE_ID);
+}
+
+/* ================= TIME ================= */
+String getUTCTime() {
+  time_t now = time(nullptr);
+  struct tm *t = gmtime(&now);
+  char buf[25];
+  sprintf(buf, "%04d-%02d-%02d %02d:%02d:%02d",
+          t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+          t->tm_hour, t->tm_min, t->tm_sec);
+  return String(buf);
+}
+
+/* ================= FIND FREE ID ================= */
+int findNextFreeFingerId() {
+  for (uint8_t i = 1; i <= 127; i++) {
+    if (finger.loadModel(i) != FINGERPRINT_OK) return i;
+  }
+  return -1;
+}
+
+/* ================= STATUS ================= */
+void publishOnlineStatus() {
+  String payload = String(DEVICE_SECRET_KEY) + "|" +
+    "{\"deviceId\":\"" + DEVICE_ID + "\",\"status\":\"ONLINE\"}";
+  client.publish(TOPIC_STATUS, payload.c_str(), true);
+}
+
+/* ================= ENROLL ================= */
+void enrollFingerprint() {
+  enrolling = true;
+  int id = findNextFreeFingerId();
+  if (id == -1) { enrolling = false; return; }
+
+  while (finger.getImage() != FINGERPRINT_OK) ledEnrollWait();
+  if (finger.image2Tz(1) != FINGERPRINT_OK) goto fail;
+
+  delay(3000);
+  while (finger.getImage() != FINGERPRINT_NOFINGER);
+
+  while (finger.getImage() != FINGERPRINT_OK) ledEnrollWait();
+  if (finger.image2Tz(2) != FINGERPRINT_OK) goto fail;
+  if (finger.createModel() != FINGERPRINT_OK) goto fail;
+
+  if (finger.storeModel(id) == FINGERPRINT_OK) {
+    ledEnrollSuccess();
+    String payload = String(DEVICE_SECRET_KEY) + "|" +
+      "{\"deviceId\":\"" + DEVICE_ID + "\",\"fingerId\":" + String(id) + ",\"result\":\"SUCCESS\"}";
+    client.publish(TOPIC_ENROLL_RESULT, payload.c_str());
+  }
+
+  enrolling = false;
+  return;
+
+fail:
+  ledEnrollFail();
+  client.publish(TOPIC_ENROLL_RESULT,
+    (String(DEVICE_SECRET_KEY) + "|{\"deviceId\":\"" + DEVICE_ID + "\",\"result\":\"FAILED\"}").c_str());
+  enrolling = false;
+}
+
+/* ================= SCAN ================= */
+void publishNotGranted() {
+  if (millis() - lastNotGrantedTime < NOT_GRANTED_COOLDOWN) return;
+  lastNotGrantedTime = millis();
+  ledDenied();
+
+  client.publish(TOPIC_SCAN,
+    (String(DEVICE_SECRET_KEY) + "|{\"deviceId\":\"" + DEVICE_ID +
+     "\",\"action\":\"not_granted\",\"time\":\"" + getUTCTime() + "\"}").c_str());
+}
+
+void scanFingerprint() {
+  if (enrolling) return;
+  if (finger.getImage() != FINGERPRINT_OK) return;
+  if (finger.image2Tz() != FINGERPRINT_OK) return;
+
+  if (finger.fingerSearch() != FINGERPRINT_OK) {
+    publishNotGranted();
+    return;
+  }
+
+  ledGranted();
+  client.publish(TOPIC_SCAN,
+    (String(DEVICE_SECRET_KEY) + "|{\"deviceId\":\"" + DEVICE_ID +
+     "\",\"fingerId\":" + String(finger.fingerID) +
+     ",\"action\":\"granted\",\"time\":\"" + getUTCTime() + "\"}").c_str());
+}
+
+/* ================= MQTT CALLBACK ================= */
+void mqttCallback(char* topic, byte* payload, unsigned int len) {
+  String msg;
+  for (unsigned int i = 0; i < len; i++) msg += (char)payload[i];
+  int sep = msg.indexOf('|');
+  if (sep == -1 || msg.substring(0, sep) != DEVICE_SECRET_KEY) return;
+
+  if (!strcmp(topic, TOPIC_ENROLL)) enrollFingerprint();
+  else if (!strcmp(topic, TOPIC_DELETE)) finger.deleteModel(msg.substring(sep + 1).toInt());
+  else if (!strcmp(topic, TOPIC_DELALL)) finger.emptyDatabase();
+  else if (!strcmp(topic, TOPIC_RESET)) ESP.restart();
+}
+
+/* ================= MQTT ================= */
+void reconnectMQTT() {
+  String lwt = String(DEVICE_SECRET_KEY) + "|{\"deviceId\":\"" + DEVICE_ID + "\",\"status\":\"OFFLINE\"}";
+  if (client.connect(DEVICE_ID, NULL, NULL, TOPIC_STATUS, 1, true, lwt.c_str())) {
+    client.subscribe(TOPIC_ENROLL);
+    client.subscribe(TOPIC_DELETE);
+    client.subscribe(TOPIC_DELALL);
+    client.subscribe(TOPIC_RESET);
+    publishOnlineStatus();
+    ledOff();
+  }
+}
+
+/* ================= SETUP ================= */
+void setup() {
+  pinMode(LED, OUTPUT);
+  ledOff();
+  Serial.begin(115200);
+
+  if (drd.detectDoubleReset()) wm.resetSettings();
+
+  char ap[32];
+  buildApName(ap, sizeof(ap));
+  wm.autoConnect(ap);
+  ledOff();
+
+  buildTopics();
+  configTime(0, 0, "pool.ntp.org");
+
+  fingerSerial.begin(57600);
+  finger.begin(57600);
+  if (!finger.verifyPassword()) while (1);
+
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(mqttCallback);
+
+  ledBoot();
+}
+
+/* ================= LOOP ================= */
+void loop() {
+  if (!client.connected()) reconnectMQTT();
+  client.loop();
+  scanFingerprint();
+
+  if (millis() - lastHeartbeat >= HEARTBEAT_INTERVAL) {
+    lastHeartbeat = millis();
+    ledHeartbeat();
+  }
+}
