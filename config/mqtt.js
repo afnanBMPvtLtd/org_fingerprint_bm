@@ -1,6 +1,8 @@
 const mqtt = require('mqtt');
 const { MQTT_BROKER } = require('./env');
 
+const { authenticateMqttMessage } = require('../services/mqttAuth.service');
+
 const { handleScanMessage } = require('../mqtt/handlers/scan.handler');
 const { handleStatusMessage } = require('../mqtt/handlers/status.handler');
 const handleEnrollResult = require('../mqtt/handlers/enrollResult.handler');
@@ -25,17 +27,23 @@ function initMQTT() {
   });
 
   mqttClient.on('message', async (topic, message) => {
-    const payload = message.toString();
+    try {
+      const auth = await authenticateMqttMessage(message.toString());
+      if (!auth) return;
 
-    if (topic.endsWith('/scan')) {
-      await handleScanMessage(topic, payload);
-    } 
-    else if (topic.endsWith('/status')) {
-      await handleStatusMessage(topic, payload);
-    } 
-    else if (topic.endsWith('/enroll/result')) {
-      const data = JSON.parse(payload.split('|')[1]);
-      await handleEnrollResult(topic, data);
+      const { device, data } = auth;
+
+      if (topic.endsWith('/scan')) {
+        await handleScanMessage(device, data);
+      }
+      else if (topic.endsWith('/status')) {
+        await handleStatusMessage(device, data);
+      }
+      else if (topic.endsWith('/enroll/result')) {
+        await handleEnrollResult(device, data);
+      }
+    } catch (err) {
+      console.error('[MQTT ERROR]', err.message);
     }
   });
 

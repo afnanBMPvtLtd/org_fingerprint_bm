@@ -9,7 +9,7 @@ async function publishToDevice(topic, payload) {
   }
 
   return new Promise((resolve, reject) => {
-    client.publish(topic, payload, {}, (err) => {
+    client.publish(topic, payload, { qos: 1 }, (err) => {
       if (err) {
         console.error('[MQTT PUBLISH ERROR]', err.message);
         reject(err);

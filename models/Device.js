@@ -13,16 +13,17 @@ const DeviceSchema = new mongoose.Schema(
       required: true
     },
 
+    // 🔓 Allow null for unregistered devices
     organization: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Organization',
-      required: true
+      default: null
     },
 
     location: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Location',
-      required: true
+      default: null
     },
 
     status: {
@@ -35,6 +36,7 @@ const DeviceSchema = new mongoose.Schema(
       type: Date
     },
 
+    // 🔐 Controls if device is usable
     isActive: {
       type: Boolean,
       default: true

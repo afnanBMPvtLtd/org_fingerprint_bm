@@ -1,93 +1,55 @@
 const PendingEnrollment = require('../../models/PendingEnrollment');
 const Employee = require('../../models/Employee');
-const Device = require('../../models/Device');
 
-async function handleEnrollResult(topic, payload) {
+async function handleEnrollResult(device, data) {
   try {
-    const { deviceId, fingerId, result } = payload;
+    const { fingerId, result } = data;
 
-    if (!deviceId || !result) {
-      console.error('[ENROLL RESULT] Invalid payload', payload);
-      return;
-    }
+    const pending = await PendingEnrollment.findOne({
+      deviceId: device.deviceId
+    });
 
-    const pending = await PendingEnrollment.findOne({ deviceId });
     if (!pending) {
-      console.log('[ENROLL] No pending enrollment for device', deviceId);
+      console.log('[ENROLL] No pending enrollment for device', device.deviceId);
       return;
     }
 
     /* ================= FAILED ================= */
     if (result !== 'SUCCESS') {
-      await PendingEnrollment.deleteOne({ deviceId });
-      console.log('[ENROLL] Enrollment FAILED for device', deviceId);
+      await PendingEnrollment.deleteOne({ deviceId: device.deviceId });
+      console.log('[ENROLL] Enrollment FAILED for device', device.deviceId);
       return;
     }
 
     if (!Number.isInteger(fingerId)) {
+      await PendingEnrollment.deleteOne({ deviceId: device.deviceId });
       console.error('[ENROLL] SUCCESS but fingerId missing');
-      await PendingEnrollment.deleteOne({ deviceId });
       return;
     }
 
-    const device = await Device.findOne({ deviceId });
-    if (!device) {
-      console.error('[ENROLL] Device not found:', deviceId);
-      await PendingEnrollment.deleteOne({ deviceId });
-      return;
-    }
+    /* ================= CREATE EMPLOYEE (SAFE) ================= */
+    try {
+      await Employee.create({
+        name: pending.name,
+        employeeCode: pending.employeeCode,
+        fingerId,
+        device: device._id,
+        organization: pending.organization,
+        location: pending.location
+      });
 
-    /* ================= DUPLICATE CHECKS ================= */
-
-    // Finger already mapped on this device
-    const fingerExists = await Employee.findOne({
-      device: device._id,
-      fingerId
-    });
-
-    if (fingerExists) {
-      console.error(
-        `[ENROLL] FingerId ${fingerId} already mapped to ${fingerExists.name}`
+      console.log(
+        `[ENROLL] Employee ${pending.name} enrolled (fingerId ${fingerId})`
       );
-      await PendingEnrollment.deleteOne({ deviceId });
-      return;
+    } catch (err) {
+      // Duplicate safety via indexes
+      console.error('[ENROLL] Employee create blocked:', err.message);
     }
 
-    // Employee code already exists in organization
-    const employeeCodeExists = await Employee.findOne({
-      organization: pending.organization,
-      employeeCode: pending.employeeCode
-    });
+    await PendingEnrollment.deleteOne({ deviceId: device.deviceId });
 
-    if (employeeCodeExists) {
-      console.error(
-        `[ENROLL] employeeCode ${pending.employeeCode} already exists`
-      );
-      await PendingEnrollment.deleteOne({ deviceId });
-      return;
-    }
-
-    /* ================= CREATE EMPLOYEE ================= */
-    const employee = await Employee.create({
-      name: pending.name,
-      employeeCode: pending.employeeCode,
-      fingerId,
-      device: device._id,
-      organization: pending.organization,
-      location: pending.location
-    });
-
-    await PendingEnrollment.deleteOne({ deviceId });
-
-    console.log(
-      `[ENROLL] Employee ${employee.name} enrolled with fingerId ${fingerId}`
-    );
   } catch (err) {
-    if (err.code === 11000) {
-      console.error('[ENROLL] Duplicate key error blocked by MongoDB');
-    } else {
-      console.error('[ENROLL RESULT ERROR]', err.message);
-    }
+    console.error('[ENROLL RESULT ERROR]', err.message);
   }
 }
 

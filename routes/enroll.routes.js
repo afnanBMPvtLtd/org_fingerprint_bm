@@ -5,11 +5,6 @@ const PendingEnrollment = require('../models/PendingEnrollment');
 const Device = require('../models/Device');
 const { getClient } = require('../config/mqtt');
 
-/**
- * START ENROLLMENT
- * Backend controls enrollment
- * ESP auto-assigns next free fingerId
- */
 router.post('/enroll/start', async (req, res) => {
   try {
     const {
@@ -20,9 +15,6 @@ router.post('/enroll/start', async (req, res) => {
       locationId
     } = req.body;
 
-    // ---------------------------
-    // 1. Validate device
-    // ---------------------------
     const device = await Device.findOne({
       deviceId,
       isActive: true
@@ -32,14 +24,14 @@ router.post('/enroll/start', async (req, res) => {
       return res.status(404).json({ error: 'Device not found or inactive' });
     }
 
-    // ---------------------------
-    // 2. Clear previous pending enrollment
-    // ---------------------------
-    await PendingEnrollment.deleteMany({ deviceId });
+    // 🔒 CHECK EXISTING ENROLLMENT
+    const existing = await PendingEnrollment.findOne({ deviceId });
+    if (existing) {
+      return res.status(409).json({
+        error: 'Enrollment already in progress for this device'
+      });
+    }
 
-    // ---------------------------
-    // 3. Create new pending enrollment
-    // ---------------------------
     await PendingEnrollment.create({
       deviceId,
       name,
@@ -48,12 +40,7 @@ router.post('/enroll/start', async (req, res) => {
       location: locationId
     });
 
-    // ---------------------------
-    // 4. Publish ENROLL command
-    // IMPORTANT: SECRET_KEY|ENROLL
-    // ---------------------------
     const mqttClient = getClient();
-
     if (!mqttClient) {
       return res.status(500).json({ error: 'MQTT client not ready' });
     }
@@ -61,30 +48,37 @@ router.post('/enroll/start', async (req, res) => {
     const topic = `device/${deviceId}/enroll`;
     const payload = `${device.secretKey}|ENROLL`;
 
-    console.log('[API] Publishing ENROLL to', topic);
-    console.log('[API] Payload:', payload);
+    mqttClient.publish(topic, payload, { qos: 1 });
 
-    mqttClient.publish(topic, payload, { qos: 1 }, (err) => {
-      if (err) {
-        console.error('[API] MQTT publish FAILED:', err.message);
-      } else {
-        console.log('[API] MQTT publish SUCCESS');
-      }
-    });
-
-    // ---------------------------
-    // 5. Respond immediately
-    // ---------------------------
     return res.json({
       status: 'ENROLL_STARTED',
-      deviceId,
-      message: 'Device instructed to start fingerprint enrollment'
+      deviceId
     });
 
   } catch (err) {
-    console.error('[API] ENROLL START ERROR:', err);
+    if (err.code === 11000) {
+      return res.status(409).json({
+        error: 'Enrollment already in progress'
+      });
+    }
+
+    console.error('[ENROLL START ERROR]', err.message);
     return res.status(500).json({ error: 'Internal server error' });
   }
+});
+router.post('/enroll/cancel', async (req, res) => {
+  const { deviceId } = req.body;
+
+  if (!deviceId) {
+    return res.status(400).json({ error: 'deviceId required' });
+  }
+
+  const deleted = await PendingEnrollment.deleteOne({ deviceId });
+
+  return res.json({
+    status: 'ENROLL_CANCELLED',
+    deleted: deleted.deletedCount
+  });
 });
 
 module.exports = router;

@@ -1,32 +1,21 @@
-const Device = require('../../models/Device');
 const Employee = require('../../models/Employee');
 const Attendance = require('../../models/Attendance');
 
-async function handleScanMessage(topic, payload) {
+async function handleScanMessage(device, data) {
   try {
-    const [, json] = payload.split('|');
-    if (!json) return;
+    const { action, fingerId, time } = data;
 
-    const data = JSON.parse(json);
-    const { deviceId, action, fingerId, time } = data;
-
-    if (!deviceId || !action) return;
+    if (!action) return;
 
     /* ================= NOT GRANTED ================= */
     if (action === 'not_granted') {
-      console.log(`[SCAN] NOT_GRANTED from device ${deviceId}`);
+      console.log(`[SCAN] NOT_GRANTED from ${device.deviceId}`);
       return;
     }
 
     /* ================= GRANTED ================= */
     if (!Number.isInteger(fingerId)) {
       console.error('[SCAN] GRANTED but fingerId missing');
-      return;
-    }
-
-    const device = await Device.findOne({ deviceId });
-    if (!device) {
-      console.error('[SCAN] Device not found:', deviceId);
       return;
     }
 
@@ -38,7 +27,7 @@ async function handleScanMessage(topic, payload) {
 
     if (!employee) {
       console.error(
-        `[SCAN] Unknown fingerId ${fingerId} on device ${deviceId}`
+        `[SCAN] Unknown fingerId ${fingerId} on device ${device.deviceId}`
       );
       return;
     }
@@ -46,7 +35,10 @@ async function handleScanMessage(topic, payload) {
     await Attendance.create({
       employee: employee._id,
       device: device._id,
+      organization: device.organization,
+      location: device.location,
       fingerId,
+      status: 'GRANTED',
       scannedAt: time ? new Date(time) : new Date()
     });
 
